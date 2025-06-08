@@ -50,10 +50,9 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
     const [file, setFile] = useState<File | string | null>(null);
     const [pdfDocProxy, setPdfDocProxy] = useState<pdfjs.PDFDocumentProxy | null>(null);
     const [numPages, setNumPages] = useState<number | null>(null);
-    const [pageNumber, setPageNumber] = useState<number>(1);
+    const [pageNumber, setPageNumber] = useState<number>(1); // Now represents the "most visible" page
 
     const [highlights, setHighlights] = useState<Highlight[]>([]);
-    // highlightedPages set is still useful for quick checks or other features
     const [highlightedPages, setHighlightedPages] = useState<Set<number>>(new Set());
     const [pageThumbnails, setPageThumbnails] = useState<Record<number, string>>({});
     const [generatingThumbnails, setGeneratingThumbnails] = useState<Set<number>>(new Set());
@@ -65,10 +64,13 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
     const [isSyncing, setIsSyncing] = useState(false);
     const [isLoadingPdf, setIsLoadingPdf] = useState(false);
     const [pdfLoadError, setPdfLoadError] = useState<string | null>(null);
-    const [scale, setScale] = useState<number>(1.0);
+    const [scale, setScale] = useState<number>(1.8); // A slightly larger default scale is often better for scrolling
     const [selectedHighlightColor, setSelectedHighlightColor] = useState<string>(HIGHLIGHT_COLORS.YELLOW);
 
     const pageContainerRef = useRef<HTMLDivElement | null>(null);
+    // NEW: Refs for individual page wrappers and the IntersectionObserver
+    const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+    const observer = useRef<IntersectionObserver | null>(null);
 
     const updateHighlightedPagesSet = useCallback((currentHighlights: Highlight[]) => {
         const pages = new Set<number>();
@@ -76,11 +78,37 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
         setHighlightedPages(pages);
     }, []);
 
+
+    const handleHighlightClick = (highlight: Highlight) => {
+        const scrollContainer = pageContainerRef.current;
+        const pageWrapper = pageRefs.current[highlight.page_number];
+
+        // Ensure we have the necessary elements and the highlight has rectangles
+        if (!scrollContainer || !pageWrapper || !highlight.rects || highlight.rects.length === 0) {
+            // As a fallback, just scroll to the top of the page
+            goToPage(highlight.page_number);
+            return;
+        }
+
+        // The top position of the page wrapper relative to the scroll container's content
+        const pageOffsetTop = pageWrapper.offsetTop;
+
+        // The top position of the first rectangle of the highlight, relative to the page wrapper, adjusted for scale
+        const highlightOffsetTop = highlight.rects[0].top * scale;
+
+        // Calculate final scroll position. We subtract a bit to show some context above the highlight.
+        const targetScrollTop = pageOffsetTop + highlightOffsetTop - 50; // scrolls 50px above the highlight
+
+        scrollContainer.scrollTo({
+            top: targetScrollTop,
+            behavior: 'smooth',
+        });
+    };
+
     const generatePageThumbnail = useCallback(async (pageNumToRender: number, pdfDocInstance: pdfjs.PDFDocumentProxy) => {
         if (!pdfDocInstance || generatingThumbnails.has(pageNumToRender) || pageThumbnails[pageNumToRender]) {
             return;
         }
-        console.log(`Generating thumbnail for page ${pageNumToRender}`);
         setGeneratingThumbnails(prev => new Set(prev).add(pageNumToRender));
         try {
             const page = await pdfDocInstance.getPage(pageNumToRender);
@@ -92,7 +120,7 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
                 return;
             }
 
-            const desiredWidth = 120;
+            const desiredWidth = 180;
             const viewport = page.getViewport({ scale: 1 });
             const thumbnailScale = desiredWidth / viewport.width;
             const thumbnailViewport = page.getViewport({ scale: thumbnailScale });
@@ -126,16 +154,48 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
         }
     }, [numPages, pdfDocProxy, generatePageThumbnail, pageThumbnails, generatingThumbnails]);
 
+    useEffect(() => {
+        // Disconnect previous observer if it exists
+        if (observer.current) {
+            observer.current.disconnect();
+        }
+
+        // Create a new observer
+        observer.current = new IntersectionObserver((entries) => {
+            const visiblePage = entries.find(entry => entry.isIntersecting);
+            if (visiblePage) {
+                const pageNum = parseInt(visiblePage.target.getAttribute('data-page-number') || '1', 10);
+                setPageNumber(pageNum);
+            }
+        }, {
+            root: pageContainerRef.current, // The scrollable element
+            threshold: 0.5, // Trigger when 50% of the page is visible
+        });
+
+        // Observe all the page elements
+        const currentObserver = observer.current;
+        Object.values(pageRefs.current).forEach(pageEl => {
+            if (pageEl) {
+                currentObserver.observe(pageEl);
+            }
+        });
+
+        // Cleanup function
+        return () => {
+            if (currentObserver) {
+                currentObserver.disconnect();
+            }
+        };
+    }, [numPages]); // Rerun when the number of pages changes
+
 
     const loadHighlightsForPdf = useCallback(async (pdfIdToLoad: string) => {
         if (!pdfIdToLoad) return;
-        console.log(`Loading highlights for PDF ID: ${pdfIdToLoad}`);
         try {
             const response = await fetch(`/api/pdf-highlights?pdfId=${encodeURIComponent(pdfIdToLoad)}`);
             if (response.ok) {
                 const data = await response.json();
                 const loadedHighlights: Highlight[] = data.highlights || [];
-                console.log(`Loaded ${loadedHighlights.length} highlights from DB.`);
                 setHighlights(loadedHighlights);
                 updateHighlightedPagesSet(loadedHighlights);
                 setHasUnsavedChanges(false);
@@ -150,85 +210,98 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
     }, [updateHighlightedPagesSet]);
 
     useEffect(() => {
-        console.log("Initial props received:", { initialFileUrl, initialPdfId });
         if (initialFileUrl && initialPdfId) {
             setFile(initialFileUrl);
             setCurrentPdfId(initialPdfId);
             setHighlights([]); updateHighlightedPagesSet([]); setHasUnsavedChanges(false);
             setPdfLoadError(null); setIsLoadingPdf(true); setPageThumbnails({});
+            pageRefs.current = {}; // Reset page refs
         } else {
             setFile(null); setCurrentPdfId(null); setHighlights([]); updateHighlightedPagesSet([]);
             setNumPages(null); setPageNumber(1); setHasUnsavedChanges(false);
             setPdfLoadError(null); setIsLoadingPdf(false); setPageThumbnails({});
             setPdfDocProxy(null);
+            pageRefs.current = {}; // Reset page refs
         }
     }, [initialFileUrl, initialPdfId, updateHighlightedPagesSet]);
 
     const onDocumentLoadSuccess = useCallback((pdf: pdfjs.PDFDocumentProxy): void => {
-        console.log("PDF Document loaded successfully. Total pages:", pdf.numPages);
         setPdfDocProxy(pdf);
         setNumPages(pdf.numPages);
         setPageNumber(1);
-        setScale(1.0);
         setIsLoadingPdf(false);
         setPdfLoadError(null);
         setPageThumbnails({});
         setGeneratingThumbnails(new Set());
+        pageRefs.current = {}; // Clear refs before re-populating
 
         if (currentPdfId) {
             loadHighlightsForPdf(currentPdfId);
         } else {
-            console.log("No currentPdfId (likely local file), not loading highlights from DB.");
             setHighlights([]); updateHighlightedPagesSet([]); setHasUnsavedChanges(false);
         }
     }, [currentPdfId, loadHighlightsForPdf, updateHighlightedPagesSet]);
 
     const onDocumentLoadError = (error: Error) => {
         console.error('Failed to load PDF with react-pdf:', error.message);
-        if (error.message.includes("The API version") && error.message.includes("does not match the Worker version")) {
-            setPdfLoadError(`PDF Worker version mismatch. (${error.message}). Please ensure 'pdfjs-dist' versions are consistent or try clearing browser cache & restarting the dev server.`);
-        } else {
-            setPdfLoadError(`Error loading PDF: ${error.message}`);
-        }
+        setPdfLoadError(`Error loading PDF: ${error.message}`);
         setIsLoadingPdf(false); setFile(null); setCurrentPdfId(null); setNumPages(null); setPdfDocProxy(null);
     };
 
     const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>): void => {
         const uploadedFile = event.target.files?.[0];
         if (uploadedFile) {
-            console.log("Local file selected:", uploadedFile.name);
             setFile(uploadedFile); setCurrentPdfId(null);
             setHighlights([]); updateHighlightedPagesSet([]); setHasUnsavedChanges(false);
             setPdfLoadError(null); setIsLoadingPdf(true); setPageThumbnails({}); setGeneratingThumbnails(new Set());
+            pageRefs.current = {}; // Reset page refs
             alert("This is a local file. To save or export highlights permanently, please upload it via 'Manage Files' and then open it from there.");
         }
     };
 
-    const goToPrevPage = () => setPageNumber(p => Math.max(1, p - 1));
-    const goToNextPage = () => setPageNumber(p => Math.min(numPages || 1, p + 1));
-    const goToPage = (num: number) => { if (num >= 1 && num <= (numPages || 0)) setPageNumber(num); };
+    // UPDATED: Navigation functions now scroll into view
+    const goToPage = (num: number) => {
+        if (num >= 1 && num <= (numPages || 0)) {
+            const pageElement = pageRefs.current[num];
+            if (pageElement) {
+                pageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+            // The observer will update the pageNumber state automatically
+        }
+    };
+    const goToPrevPage = () => goToPage(pageNumber - 1);
+    const goToNextPage = () => goToPage(pageNumber + 1);
+
     const zoomIn = () => setScale(s => parseFloat((s + 0.2).toFixed(1)));
     const zoomOut = () => setScale(s => parseFloat(Math.max(0.2, s - 0.2).toFixed(1)));
-    const resetZoom = () => setScale(1.0);
+    const resetZoom = () => setScale(1.8);
 
     const addHighlight = (): void => {
-        if (!pageContainerRef.current) { console.error("Page container ref not set."); return; }
         const selection = window.getSelection();
         if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return;
-        const pageWrapperDiv = pageContainerRef.current.querySelector('.react-pdf__Page');
-        if (!pageWrapperDiv) { console.error("Could not find .react-pdf__Page div."); return; }
+
+        // Use the ref of the currently visible page to calculate coordinates
+        const pageWrapperDiv = pageRefs.current[pageNumber];
+        if (!pageWrapperDiv) { console.error(`Could not find page container ref for page ${pageNumber}`); return; }
+
         const pageRect = pageWrapperDiv.getBoundingClientRect();
         const clientRects = Array.from(selection.getRangeAt(0).getClientRects());
+
         const newHighlightRects: HighlightRect[] = clientRects.map(cr => ({
-            top: (cr.top - pageRect.top) / scale, left: (cr.left - pageRect.left) / scale,
-            width: cr.width / scale, height: cr.height / scale,
+            top: (cr.top - pageRect.top) / scale,
+            left: (cr.left - pageRect.left) / scale,
+            width: cr.width / scale,
+            height: cr.height / scale,
         }));
+
         if (newHighlightRects.length === 0 || newHighlightRects.every(r => r.width === 0 || r.height === 0)) {
-            selection.removeAllRanges(); return;
+            selection.removeAllRanges();
+            return;
         }
+
         const newHighlight: Highlight = {
             id: `hl-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-            page_number: pageNumber,
+            page_number: pageNumber, // The currently visible page
             rects: newHighlightRects,
             selected_text: selection.toString(),
             color: selectedHighlightColor
@@ -239,6 +312,7 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
         setHasUnsavedChanges(true);
         selection.removeAllRanges();
     };
+
 
     const handleDeleteHighlight = (highlightIdToDelete: string): void => {
         const updatedHighlights = highlights.filter(h => h.id !== highlightIdToDelete);
@@ -310,54 +384,90 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
         } finally { setIsExporting(false); }
     };
 
-    const currentPa_geHighlights = highlights.filter(h => h.page_number === pageNumber);
-
-    const groupedHighlightsByColor = currentPa_geHighlights.reduce((acc, highlight) => {
-        const colorKey = highlight.color || HIGHLIGHT_COLORS.YELLOW;
-        if (!acc[colorKey]) { acc[colorKey] = []; }
-        acc[colorKey].push(highlight);
+    const allHighlightsGroupedByPage = highlights.reduce((acc, highlight) => {
+        const pageKey = highlight.page_number;
+        if (!acc[pageKey]) {
+            acc[pageKey] = [];
+        }
+        acc[pageKey].push(highlight);
+        // Optional: Sort highlights within a page by their vertical position
+        acc[pageKey].sort((a, b) => a.rects[0]?.top - b.rects[0]?.top);
         return acc;
-    }, {} as Record<string, Highlight[]>);
+    }, {} as Record<number, Highlight[]>);
+
+    // Get a sorted list of page numbers that have highlights
+    const pagesWithHighlights = Object.keys(allHighlightsGroupedByPage).map(Number).sort((a, b) => a - b);
 
     return (
         <div style={{ display: 'flex', height: '100vh', color: 'black', backgroundColor: '#333' }}>
-
-            {/* Left Sidebar: Highlights on Current Page Section */}
             <div style={{ width: '250px', borderRight: '1px solid #555', backgroundColor: '#444', display: 'flex', flexDirection: 'column', overflow: 'hidden', padding: '10px' }}>
-                {(file || initialFileUrl) && numPages && (
-                    <div style={{ flexGrow: 1, overflowY: 'auto' }}>
-                        <h4 style={{ color: 'white', marginBottom: '10px', marginTop: '5px', textAlign: 'center' }}>Highlights on Page {pageNumber}</h4>
-                        {Object.keys(groupedHighlightsByColor).length > 0 ? (
-                            Object.entries(groupedHighlightsByColor).map(([colorRgba, highlightsInGroup]) => (
-                                <div key={colorRgba} style={{ marginBottom: '15px' }}>
-                                    <h5 style={{ color: 'white', marginBottom: '5px', padding: '3px 6px', backgroundColor: colorRgba, borderRadius: '3px', display: 'inline-block', border: '1px solid #777' }}>
-                                        {getColorName(colorRgba)}
-                                    </h5>
-                                    <ul style={{ listStyle: 'none', padding: '0 0 0 10px', fontSize: '0.9em' }}>
-                                        {highlightsInGroup.map(h => (
-                                            <li key={h.id} style={{ color: '#ddd', marginBottom: '8px', padding: '5px', backgroundColor: '#505050', borderRadius: '3px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: '5px' }} title={h.selected_text}>
-                                                    "{h.selected_text.substring(0, 20)}..."
-                                                </span>
-                                                <button onClick={() => handleDeleteHighlight(h.id)} title="Delete highlight" style={{ background: '#700', color: 'white', border: 'none', borderRadius: '3px', padding: '2px 5px', cursor: 'pointer', fontSize: '0.8em' }}>X</button>
-                                            </li>
-                                        ))}
-                                    </ul>
-                                </div>
-                            ))
-                        ) : (
-                            <p style={{ color: '#ccc', fontSize: '0.8em', textAlign: 'center' }}>No highlights on this page.</p>
-                        )}
-                    </div>
-                )}
-                {!(file || initialFileUrl) && !isLoadingPdf && (
-                    <p style={{ color: '#ccc', textAlign: 'center', marginTop: '20px' }}>Load a PDF to see highlights.</p>
-                )}
+                <div style={{ flexGrow: 1, overflowY: 'auto' }}>
+                    <h4 style={{ color: 'white', marginBottom: '15px', marginTop: '5px', textAlign: 'center' }}>All Highlights</h4>
+
+                    {highlights.length > 0 ? (
+                        pagesWithHighlights.map(pn => (
+                            <div key={`page-group-${pn}`} style={{ marginBottom: '20px' }}>
+                                <h5
+                                    onClick={() => goToPage(pn)}
+                                    style={{
+                                        color: '#ccc',
+                                        marginBottom: '10px',
+                                        padding: '4px 8px',
+                                        backgroundColor: '#3a3a3a',
+                                        borderRadius: '3px',
+                                        borderBottom: '1px solid #555',
+                                        cursor: 'pointer'
+                                    }}
+                                    title={`Go to Page ${pn}`}
+                                >
+                                    Page {pn}
+                                </h5>
+                                <ul style={{ listStyle: 'none', padding: '0 0 0 10px', margin: 0, fontSize: '0.9em' }}>
+                                    {allHighlightsGroupedByPage[pn].map(h => (
+                                        <li
+                                            key={h.id}
+                                            onClick={() => handleHighlightClick(h)}
+                                            title={`Click to view: "${h.selected_text}"`}
+                                            style={{
+                                                color: '#ddd',
+                                                marginBottom: '8px',
+                                                padding: '5px',
+                                                backgroundColor: '#505050',
+                                                borderRadius: '3px',
+                                                display: 'flex',
+                                                justifyContent: 'space-between',
+                                                alignItems: 'center',
+                                                cursor: 'pointer',
+                                                borderLeft: `3px solid ${h.color || HIGHLIGHT_COLORS.YELLOW}` // Add color indicator
+                                            }}
+                                        >
+                                            <span style={{ paddingLeft: '5px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginRight: '5px' }}>
+                                                "{h.selected_text.substring(0, 20)}..."
+                                            </span>
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    handleDeleteHighlight(h.id);
+                                                }}
+                                                title="Delete highlight"
+                                                style={{ background: '#700', color: 'white', border: 'none', borderRadius: '3px', padding: '2px 5px', cursor: 'pointer', fontSize: '0.8em', flexShrink: 0 }}
+                                            >
+                                                X
+                                            </button>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        ))
+                    ) : (
+                        <p style={{ color: '#ccc', fontSize: '0.8em', textAlign: 'center', marginTop: '20px' }}>
+                            {file || initialFileUrl ? 'No highlights in this document.' : 'Load a PDF to see highlights.'}
+                        </p>
+                    )}
+                </div>
             </div>
 
-            {/* Main Editor Area (Toolbar and PDF Display) - Center */}
             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '10px', overflow: 'hidden', color: '#ffffff' }}>
-                {/* Toolbar */}
                 <div style={{ marginBottom: '10px', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '10px', paddingBottom: '10px', borderBottom: '1px solid #555', width: '100%', justifyContent: 'center' }}>
                     <input type="file" onChange={handleFileChange} accept=".pdf" style={{ color: 'white', display: (initialFileUrl && file === initialFileUrl) ? 'none' : 'block' }} disabled={!!(initialFileUrl && file === initialFileUrl)} />
                     {(file || initialFileUrl) && numPages && (
@@ -386,55 +496,65 @@ export default function PDFEditorComponent({ initialFileUrl, initialPdfId }: PDF
                         </>
                     )}
                 </div>
-
-                <div style={{ flex: 1, width: '100%', overflow: 'auto', textAlign: 'center' }} onMouseUp={addHighlight} >
+                {/* UPDATED: Container is now the scroll root, onMouseUp removed */}
+                <div ref={pageContainerRef} style={{ flex: 1, width: '100%', overflow: 'auto', textAlign: 'center' }}>
                     {isLoadingPdf && <p style={{ color: 'white', marginTop: '20px' }}>Loading PDF...</p>}
                     {pdfLoadError && <p style={{ color: 'red', marginTop: '20px' }}>{pdfLoadError}</p>}
                     {!isLoadingPdf && !pdfLoadError && !file && !initialFileUrl && (
                         <p style={{ color: 'white', marginTop: '20px' }}>Please select a PDF or open one from Manage Files.</p>
                     )}
                     {file && !pdfLoadError && (
-                        <div ref={pageContainerRef} style={{ position: 'relative', display: 'inline-block' }}>
-                            <Document
-                                file={file}
-                                onLoadSuccess={onDocumentLoadSuccess}
-                                onLoadError={onDocumentLoadError}
-                                loading=""
-                                error=""
-                            >
-                                <Page
-                                    key={`${currentPdfId || 'local'}-page-${pageNumber}-scale-${scale}`}
-                                    pageNumber={pageNumber}
-                                    scale={scale}
-                                    renderTextLayer={true}
-                                    renderAnnotationLayer={false}
-                                />
-                            </Document>
-                            {currentPa_geHighlights.map(h =>
-                                h.rects.map((rect, index) => (
-                                    <div
-                                        key={`${h.id}-rect-${index}`}
-                                        style={{
-                                            position: 'absolute',
-                                            top: `${rect.top * scale}px`,
-                                            left: `${rect.left * scale}px`,
-                                            width: `${rect.width * scale}px`,
-                                            height: `${rect.height * scale}px`,
-                                            backgroundColor: h.color || HIGHLIGHT_COLORS.YELLOW,
-                                            pointerEvents: 'none',
-                                            zIndex: 10
-                                        }}
+                        <Document
+                            file={file}
+                            onLoadSuccess={onDocumentLoadSuccess}
+                            onLoadError={onDocumentLoadError}
+                            loading=""
+                            error=""
+                        >
+                            {/* UPDATED: Render all pages in a loop */}
+                            {numPages && Array.from({ length: numPages }, (_, i) => i + 1).map(pn => (
+                                <div
+                                    key={`page-wrapper-${pn}`}
+                                    ref={(el: HTMLDivElement | null) => {
+                                        pageRefs.current[pn] = el;
+                                    }}
+                                    data-page-number={pn}
+                                    style={{ position: 'relative', marginBottom: '20px', display: 'inline-block' }}
+                                >
+                                    <Page
+                                        key={`${currentPdfId || 'local'}-page-${pn}`}
+                                        pageNumber={pn}
+                                        scale={scale}
+                                        renderTextLayer={true}
+                                        renderAnnotationLayer={false}
                                     />
-                                ))
-                            )}
-                        </div>
+                                    {/* Render highlights for this specific page */}
+                                    {highlights.filter(h => h.page_number === pn).map(h =>
+                                        h.rects.map((rect, index) => (
+                                            <div
+                                                key={`${h.id}-rect-${index}`}
+                                                style={{
+                                                    position: 'absolute',
+                                                    top: `${rect.top * scale}px`,
+                                                    left: `${rect.left * scale}px`,
+                                                    width: `${rect.width * scale}px`,
+                                                    height: `${rect.height * scale}px`,
+                                                    backgroundColor: h.color || HIGHLIGHT_COLORS.YELLOW,
+                                                    pointerEvents: 'none',
+                                                    zIndex: 10
+                                                }}
+                                            />
+                                        ))
+                                    )}
+                                </div>
+                            ))}
+                        </Document>
                     )}
                 </div>
             </div>
 
-            {/* Right Sidebar: Page Thumbnails Navigation */}
             <div style={{ width: '200px', borderLeft: '1px solid #555', backgroundColor: '#444', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                <div style={{ padding: '10px', overflowY: 'auto', flexGrow: 1 /* Allow this to take full height */ }}>
+                <div style={{ padding: '10px', overflowY: 'auto', flexGrow: 1 }}>
                     <h3 style={{ color: 'white', marginTop: 0, marginBottom: '10px', textAlign: 'center' }}>Pages</h3>
                     {isLoadingPdf && <p style={{ color: '#ccc', textAlign: 'center' }}>Loading Pages...</p>}
                     {!isLoadingPdf && numPages && pdfDocProxy ? (
