@@ -1,187 +1,147 @@
-'use client'
-import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { FormEvent, useCallback, useEffect, useState } from 'react'; // Added useCallback
+"use client";
 
-interface PDFFileFromSupabase {
-    id: string;         // Supabase UUID for the 'pdfs' table row
-    pdfId: string;      // Often same as 'id', used for consistency if needed elsewhere
-    filename: string;
-    publicUrl: string;  // Public URL from Supabase Storage
-    storage_object_path?: string; // Path in Supabase Storage, needed for deletion
-    file_size?: number; // Optional, ensure your API sends it if you use it
-    uploaded_at: string;
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { apiJson, API_BASE } from "@/utils/api";
+
+interface PDF {
+  id: string;
+  filename: string;
+  file_size: number;
+  page_count: number;
+  source_type: string;
+  converted_content: string;
+  created_at: string;
 }
 
-export default function ManageFilesPage() {
-    const router = useRouter();
-    const [selectedFile, setSelectedFile] = useState<File | null>(null);
-    const [pdfFiles, setPdfFiles] = useState<PDFFileFromSupabase[]>([]);
-    const [isLoading, setIsLoading] = useState<boolean>(false);
-    const [message, setMessage] = useState<string>('');
+export default function ManageFiles() {
+  const [pdfs, setPdfs] = useState<PDF[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const router = useRouter();
 
-    const fetchPDFFiles = useCallback(async () => { // Wrapped in useCallback
-        setIsLoading(true);
-        setMessage(''); // Clear previous messages
-        try {
-            const response = await fetch('/api/list-pdfs');
-            if (response.ok) {
-                const data = await response.json();
-                setPdfFiles(data);
-            } else {
-                const errorData = await response.json();
-                setMessage(`Error fetching PDF files: ${errorData.error || response.statusText}`);
-            }
-        } catch (error) {
-            setMessage('Error connecting to server to fetch files.');
-            console.error(error);
-        }
-        setIsLoading(false);
-    }, []); // Empty dependency array, fetchPDFFiles doesn't depend on component state to be defined
+  const loadPdfs = async () => {
+    try {
+      const data = await apiJson("/pdfs");
+      setPdfs(data || []);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-    useEffect(() => {
-        fetchPDFFiles();
-    }, [fetchPDFFiles]); // fetchPDFFiles is now a stable dependency
+  useEffect(() => { loadPdfs(); }, []);
 
-    const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-        if (event.target.files && event.target.files[0]) {
-            setSelectedFile(event.target.files[0]);
-            setMessage('');
-        } else {
-            setSelectedFile(null);
-        }
-    };
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    try {
+      const form = new FormData();
+      form.append("pdfFile", file);
+      const res = await fetch(`${API_BASE}/pdfs`, {
+        method: "POST",
+        headers: { "X-API-Key": process.env.NEXT_PUBLIC_API_KEY || "dev-api-key-change-me" },
+        body: form,
+      });
+      if (!res.ok) throw new Error((await res.json()).error || "Upload failed");
+      setSuccess(`Uploaded: ${file.name}`);
+      loadPdfs();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setUploading(false);
+    }
+  };
 
-    const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-        event.preventDefault();
-        if (!selectedFile) {
-            setMessage('Please select a PDF file to upload.');
-            return;
-        }
-        setIsLoading(true);
-        setMessage('');
+  const handleDelete = async (id: string) => {
+    if (!confirm("Delete this PDF and all its data?")) return;
+    try {
+      await apiJson(`/pdfs/${id}`, { method: "DELETE" });
+      loadPdfs();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
 
-        const formData = new FormData();
-        formData.append('pdfFile', selectedFile);
+  const handleConvert = async (id: string) => {
+    setError("");
+    try {
+      await apiJson(`/pdfs/${id}/convert`, { method: "POST" });
+      loadPdfs();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
 
-        try {
-            const response = await fetch('/api/upload-pdf', {
-                method: 'POST',
-                body: formData,
-            });
+  const formatSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
 
-            const result = await response.json();
-            if (response.ok) {
-                setMessage(`File '${result.fileInfo?.filename}' uploaded successfully!`);
-                setSelectedFile(null);
-                if (event.target instanceof HTMLFormElement) { // Reset form input
-                    event.target.reset();
-                }
-                fetchPDFFiles(); // Refresh the list
-            } else {
-                setMessage(`Upload failed: ${result.error || 'Unknown error'}`);
-            }
-        } catch (error) {
-            setMessage('Upload error: Could not connect to the server.');
-            console.error(error);
-        }
-        setIsLoading(false);
-    };
-
-    const handleOpenFileInEditor = (file: PDFFileFromSupabase) => {
-        router.push(`/editor?fileUrl=${encodeURIComponent(file.publicUrl)}&pdfId=${encodeURIComponent(file.id)}`);
-    };
-
-    const handleDeleteFile = async (fileToDelete: PDFFileFromSupabase) => {
-        if (!window.confirm(`Are you sure you want to delete "${fileToDelete.filename}"? This action cannot be undone.`)) {
-            return;
-        }
-
-        if (!fileToDelete.storage_object_path) {
-            setMessage(`Error: Storage path for ${fileToDelete.filename} is missing. Cannot delete.`);
-            console.error("Missing storage_object_path for file:", fileToDelete);
-            return;
-        }
-
-        setIsLoading(true);
-        setMessage('');
-        try {
-            const response = await fetch('/api/delete-pdf', {
-                method: 'DELETE',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    pdfId: fileToDelete.id, // The UUID from 'pdfs' table
-                    storagePath: fileToDelete.storage_object_path // The path in Supabase Storage
-                }),
-            });
-
-            const result = await response.json();
-            if (response.ok) {
-                setMessage(result.message || `File '${fileToDelete.filename}' deleted successfully!`);
-                fetchPDFFiles(); // Refresh the list
-            } else {
-                setMessage(`Delete failed: ${result.error || 'Unknown error'}`);
-            }
-        } catch (error) {
-            setMessage('Delete error: Could not connect to the server.');
-            console.error(error);
-        }
-        setIsLoading(false);
-    };
-
-
-    return (
-        <div style={{ padding: '20px', fontFamily: 'Arial, sans-serif', maxWidth: '800px', margin: '0 auto', color: '#333' }}>
-            <h1 style={{ textAlign: 'center', color: '#1a1a1a' }}>Manage PDF Files</h1>
-
-            <form onSubmit={handleSubmit} style={{ marginBottom: '30px', padding: '20px', border: '1px solid #ccc', borderRadius: '8px', backgroundColor: '#f9f9f9' }}>
-                <h2 style={{ marginTop: 0, color: '#1a1a1a' }}>Upload New PDF</h2>
-                <input type="file" accept=".pdf" onChange={handleFileChange} required style={{ marginBottom: '10px', display: 'block', padding: '8px', border: '1px solid #ddd', borderRadius: '4px' }} />
-                <button type="submit" disabled={isLoading || !selectedFile} style={{ padding: '10px 15px', backgroundColor: '#007bff', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', opacity: (isLoading || !selectedFile) ? 0.6 : 1 }}>
-                    {isLoading && selectedFile ? 'Uploading...' : 'Upload PDF'}
-                </button>
-                {message && <p style={{ marginTop: '10px', padding: '10px', borderRadius: '4px', backgroundColor: message.startsWith('Error') || message.startsWith('Upload failed') || message.startsWith('Delete failed') ? '#ffebee' : '#e8f5e9', color: message.startsWith('Error') || message.startsWith('Upload failed') || message.startsWith('Delete failed') ? '#c62828' : '#2e7d32' }}>{message}</p>}
-            </form>
-
-            <h2 style={{ color: '#1a1a1a' }}>Uploaded PDF Files</h2>
-            {isLoading && pdfFiles.length === 0 && <p>Loading files...</p>}
-            {!isLoading && pdfFiles.length === 0 && <p>No PDF files found in the database.</p>}
-            {pdfFiles.length > 0 && (
-                <ul style={{ listStyle: 'none', padding: 0 }}>
-                    {pdfFiles.map((file) => (
-                        <li key={file.id} style={{ marginBottom: '10px', padding: '15px', border: '1px solid #eee', borderRadius: '8px', backgroundColor: 'white', display: 'flex', justifyContent: 'space-between', alignItems: 'center', boxShadow: '0 2px 4px rgba(0,0,0,0.05)' }}>
-                            <div>
-                                <strong style={{ fontSize: '1.1em', color: '#222' }}>{file.filename}</strong>
-                                <br />
-                                <small style={{ color: '#666' }}>Uploaded: {new Date(file.uploaded_at).toLocaleDateString()} {new Date(file.uploaded_at).toLocaleTimeString()}</small>
-                                {file.file_size && <small style={{ color: '#666', marginLeft: '10px' }}>Size: {(file.file_size / 1024).toFixed(2)} KB</small>}
-                            </div>
-                            <div style={{ display: 'flex', gap: '10px' }}>
-                                <button
-                                    onClick={() => handleOpenFileInEditor(file)}
-                                    style={{ padding: '8px 12px', backgroundColor: '#28a745', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
-                                >
-                                    Open
-                                </button>
-                                <button
-                                    onClick={() => handleDeleteFile(file)}
-                                    disabled={isLoading}
-                                    style={{ padding: '8px 12px', backgroundColor: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', opacity: isLoading ? 0.6 : 1 }}
-                                >
-                                    Delete
-                                </button>
-                            </div>
-                        </li>
-                    ))}
-                </ul>
-            )}
-            <div style={{ marginTop: '30px', textAlign: 'center' }}>
-                <Link href="/editor" style={{ color: '#007bff', textDecoration: 'none', padding: '10px 15px', border: '1px solid #007bff', borderRadius: '4px' }}>
-                    Go to Manual PDF Editor
-                </Link>
-            </div>
+  return (
+    <div style={{ maxWidth: 900, margin: "0 auto", padding: "2rem" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "2rem" }}>
+        <h1 style={{ fontSize: "1.5rem", fontWeight: 700 }}>PDF Files</h1>
+        <div style={{ display: "flex", gap: "0.75rem" }}>
+          <label style={{ padding: "0.6rem 1.2rem", background: "var(--accent)", color: "white", borderRadius: 8, cursor: "pointer", fontWeight: 600, fontSize: "0.9rem" }}>
+            {uploading ? "Uploading..." : "Upload PDF"}
+            <input type="file" accept=".pdf" onChange={handleUpload} style={{ display: "none" }} disabled={uploading} />
+          </label>
         </div>
-    );
+      </div>
+
+      {error && <div style={{ padding: "0.75rem 1rem", background: "rgba(239,68,68,0.15)", color: "var(--red)", borderRadius: 8, marginBottom: "1rem" }}>{error}</div>}
+      {success && <div style={{ padding: "0.75rem 1rem", background: "rgba(34,197,94,0.15)", color: "var(--green)", borderRadius: 8, marginBottom: "1rem" }}>{success}</div>}
+
+      {loading ? (
+        <p style={{ color: "var(--text2)" }}>Loading...</p>
+      ) : pdfs.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "3rem", color: "var(--text2)" }}>
+          <p style={{ fontSize: "1.1rem", marginBottom: "0.5rem" }}>No PDFs yet</p>
+          <p>Upload a PDF to get started</p>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+          {pdfs.map((pdf) => (
+            <div key={pdf.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "1rem 1.25rem", background: "var(--surface)", borderRadius: 12, border: "1px solid var(--border)" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 600, marginBottom: "0.25rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pdf.filename}</div>
+                <div style={{ fontSize: "0.8rem", color: "var(--text2)", display: "flex", gap: "1rem" }}>
+                  <span>{formatSize(pdf.file_size)}</span>
+                  <span>{pdf.source_type}</span>
+                  <span>{pdf.converted_content ? "✓ Converted" : "Not converted"}</span>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0 }}>
+                {!pdf.converted_content && (
+                  <button onClick={() => handleConvert(pdf.id)} style={{ padding: "0.4rem 0.8rem", background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 6, cursor: "pointer", fontSize: "0.8rem" }}>
+                    Convert
+                  </button>
+                )}
+                <button onClick={() => router.push(`/editor?pdfId=${pdf.id}`)} style={{ padding: "0.4rem 0.8rem", background: "var(--accent)", color: "white", border: "none", borderRadius: 6, cursor: "pointer", fontSize: "0.8rem" }}>
+                  Open
+                </button>
+                <button onClick={() => {
+                  const link = `${window.location.origin}/preview/${pdf.id}`;
+                  navigator.clipboard.writeText(link);
+                  setSuccess("Preview link copied!");
+                }} style={{ padding: "0.4rem 0.8rem", background: "var(--surface2)", color: "var(--text2)", border: "1px solid var(--border)", borderRadius: 6, cursor: "pointer", fontSize: "0.8rem" }}>
+                  Copy Link
+                </button>
+                <button onClick={() => handleDelete(pdf.id)} style={{ padding: "0.4rem 0.8rem", background: "transparent", color: "var(--red)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 6, cursor: "pointer", fontSize: "0.8rem" }}>
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }

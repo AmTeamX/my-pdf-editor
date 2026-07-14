@@ -1,0 +1,3 @@
+opendataloader-pdf
+fastapi
+uvicorn

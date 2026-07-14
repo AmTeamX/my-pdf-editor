@@ -1,0 +1,131 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pdf-postgres
+    environment:
+      - POSTGRES_USER=pdfeditor
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-pdfeditor123}
+      - POSTGRES_DB=pdfeditor
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdfeditor"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: pdf-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD:-minioadmin123}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  converter-standard:
+    build:
+      context: ./services/pdf-converter
+      dockerfile: Dockerfile
+    container_name: pdf-converter-std
+    ports:
+      - "8000:8000"
+    volumes:
+      - pdf_uploads:/app/uploads:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  converter-hybrid:
+    build:
+      context: ./services/pdf-converter
+      dockerfile: Dockerfile.hybrid
+    container_name: pdf-converter-hyb
+    ports:
+      - "5002:5002"
+    volumes:
+      - pdf_uploads:/app/uploads:ro
+      - hybrid_cache:/app/cache
+    restart: unless-stopped
+    profiles:
+      - hybrid
+
+  typhoon-ocr:
+    build:
+      context: ./services/typhoon-ocr
+      dockerfile: Dockerfile
+    container_name: typhoon-ocr
+    ports:
+      - "8100:8100"
+    environment:
+      - TYPHOON_API_URL=${TYPHOON_API_URL:-https://api.opentyphoon.ai/v1}
+      - TYPHOON_MODEL=${TYPHOON_MODEL:-typhoon-ocr}
+      - TYPHOON_API_KEY=${TYPHOON_API_KEY:-}
+    volumes:
+      - pdf_uploads:/app/uploads:ro
+    restart: unless-stopped
+    profiles:
+      - ocr
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pdf-backend
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - API_KEY=${API_KEY:-dev-api-key-change-me}
+      - DATABASE_URL=postgres://pdfeditor:${DB_PASSWORD:-pdfeditor123}@postgres:5432/pdfeditor?sslmode=disable
+      - UPLOAD_DIR=/app/uploads
+      - CONVERTER_STD_URL=http://converter-standard:8000
+      - CONVERTER_HYB_URL=http://converter-hybrid:5002
+      - TYPHOON_OCR_URL=${TYPHOON_OCR_URL:-}
+      - TYPHOON_API_KEY=${TYPHOON_API_KEY:-}
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_PASSWORD:-minioadmin123}
+      - MINIO_BUCKET=pdf-uploads
+    volumes:
+      - pdf_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8080/api
+        - NEXT_PUBLIC_API_KEY=${API_KEY:-dev-api-key-change-me}
+    container_name: pdf-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  minio_data:
+  pdf_uploads:
+  hybrid_cache:
