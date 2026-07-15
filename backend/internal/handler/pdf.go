@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,7 +23,12 @@ type PDFHandler struct {
 }
 
 func NewPDFHandler(db database.Database, cfg *config.Config) *PDFHandler {
-	storage, _ := NewStorage(cfg.UploadDir)
+	storage, err := NewStorage(cfg.UploadDir)
+	if err != nil {
+		log.Printf("Storage init failed (falling back to local): %v", err)
+		os.MkdirAll(cfg.UploadDir, 0755)
+		storage = &Storage{useMinIO: false, baseDir: cfg.UploadDir}
+	}
 	return &PDFHandler{db: db, cfg: cfg, storage: storage}
 }
 
